@@ -1,56 +1,72 @@
 import mysql.connector
-import os
+import time
+import icalendar
 import smtplib
-from email.message import EmailMessage
-from icalendar import Calendar
+from email.mime.text import MIMEText
+from email.utils import formataddr
+
+print("Starte Terminüberwachung...")
+
+# Verbindungsparameter aus Umgebungsvariablen
+import os
+
+DB_HOST = os.getenv("DB_HOST")
+DB_USER = os.getenv("DB_USER")
+DB_PASS = os.getenv("DB_PASS")
+DB_NAME = os.getenv("DB_NAME")
+
+SMTP_SERVER = os.getenv("SMTP_SERVER")
+SMTP_PORT = int(os.getenv("SMTP_PORT"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+FROM_EMAIL = os.getenv("FROM_EMAIL")
 
 conn = mysql.connector.connect(
-    host=os.getenv("DB_HOST"),
-    user=os.getenv("DB_USER"),
-    password=os.getenv("DB_PASS"),
-    database=os.getenv("DB_NAME")
+    host=DB_HOST,
+    user=DB_USER,
+    password=DB_PASS,
+    database=DB_NAME
 )
 
 cursor = conn.cursor(dictionary=True)
+last_ids = set()
 
-cursor.execute("""
-    SELECT calendardata FROM calendarobjects
-    WHERE componenttype = 'VEVENT' AND lastmodified >= UNIX_TIMESTAMP(NOW() - INTERVAL 1 MINUTE)
-""")
-rows = cursor.fetchall()
+while True:
+    cursor.execute("SELECT id, calendardata FROM calendarobjects ORDER BY id DESC LIMIT 5")
+    rows = cursor.fetchall()
+    for row in rows:
+        if row['id'] not in last_ids:
+            last_ids.add(row['id'])
 
-for row in rows:
-    cal = Calendar.from_ical(row['calendardata'])
-    event = next(c for c in cal.walk() if c.name == "VEVENT")
-    attendees = event.get("attendee")
-    if not attendees:
-        continue
-    if not isinstance(attendees, list):
-        attendees = [attendees]
+            try:
+                # Wichtig: Kein .encode(), da Daten bereits bytes sind
+                ical = icalendar.Calendar.from_ical(row['calendardata'])
 
-    msg = EmailMessage()
-    msg["Subject"] = f"Einladung: {event.get('summary')}"
-    msg["From"] = os.getenv("FROM_EMAIL")
-    msg["To"] = ", ".join([a.to_ical().decode().replace("mailto:", "") for a in attendees])
-    msg.set_content(f"""Einladung:
+                for component in ical.walk():
+                    if component.name == "VEVENT":
+                        summary = component.get("summary", "Kein Titel")
+                        dtstart = component.get("dtstart").dt
+                        attendees = component.get("attendee")
+                        if not attendees:
+                            continue
+                        if not isinstance(attendees, list):
+                            attendees = [attendees]
 
-Titel: {event.get('summary')}
-Beginn: {event.get('dtstart').dt}
-Ende: {event.get('dtend').dt}
-Ort: {event.get('location', 'nicht angegeben')}
-""")
+                        for attendee in attendees:
+                            email = attendee.to_ical().decode().replace("mailto:", "")
+                            msg = MIMEText(f"Neue Einladung: {summary}\nBeginn: {dtstart}")
+                            msg["Subject"] = f"Einladung: {summary}"
+                            msg["From"] = formataddr(("Kalender", FROM_EMAIL))
+                            msg["To"] = email
 
-    msg.add_attachment(
-        row['calendardata'].encode(),
-        maintype="text",
-        subtype="calendar",
-        filename="invite.ics"
-    )
+                            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+                                server.starttls()
+                                server.login(SMTP_USER, SMTP_PASS)
+                                server.sendmail(FROM_EMAIL, [email], msg.as_string())
 
-    with smtplib.SMTP(os.getenv("SMTP_SERVER"), int(os.getenv("SMTP_PORT"))) as s:
-        s.starttls()
-        s.login(os.getenv("SMTP_USER"), os.getenv("SMTP_PASS"))
-        s.send_message(msg)
+                            print(f"Einladung gesendet an: {email}")
 
-cursor.close()
-conn.close()
+            except Exception as e:
+                print(f"Fehler beim Verarbeiten von Eintrag {row['id']}: {e}")
+
+    time.sleep(30)  # Alle 30 Sekunden prüfen
